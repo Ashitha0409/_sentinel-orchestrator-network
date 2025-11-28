@@ -1,0 +1,46 @@
+# =============================================================================
+# Sentinel Orchestrator Network (SON) - Root Docker Compose
+# This file orchestrates the entire SON stack including:
+# - Backend (FastAPI Orchestrator + Agents)
+# - Hydra Node (L2 Consensus Layer)
+# - Midnight Devnet (ZK Proof Generation)
+# 
+# Usage: docker-compose up -d
+# =============================================================================
+
+version: '3.8'
+
+services:
+  # Backend Orchestrator Service
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    depends_on:
+      - hydra-node
+    networks:
+      - son-network
+
+  # Hydra Node Service
+  hydra-node:
+    build: ./hydra-node
+    ports:
+      - "4001:4001"
+    volumes:
+      - ./hydra-node/ledger:/app/ledger
+    networks:
+      - son-network
+
+  # Midnight Devnet Service
+  midnight-devnet:
+    build: ./midnight-devnet
+    ports:
+      - "9000:9000"
+    networks:
+      - son-network
+
+networks:
+  son-network:
+    driver: bridge

@@ -1,0 +1,92 @@
+{
+  "_comment": "=============================================================================",
+  "_description": "Sentinel Orchestrator Network (SON) - API Schema",
+  "_purpose": "Strict JSON contracts for all API communications in the SON system",
+  "_version": "1.0",
+  "_change_policy": "Breaking changes require 2 approvals in team chat",
+  "_owner": "Shared - All Team Members",
+  "_comment_end": "=============================================================================",
+
+  "schema_version": "1.0",
+  
+  "external_api": {
+    "scan": {
+      "endpoint": "POST /api/v1/scan",
+      "auth": "Bearer son_hackathon_token_2025",
+      "request": {
+        "schema_version": "1.0",
+        "policy_id": "string (hex)",
+        "mock_mode": "boolean (optional, default: false)"
+      },
+      "response_success": {
+        "status_code": 202,
+        "body": {
+          "task_id": "string",
+          "status": "processing",
+          "estimated_time": "number (seconds)"
+        }
+      },
+      "response_error": {
+        "status_code": 400,
+        "body": {
+          "error_code": "string",
+          "message": "string"
+        }
+      }
+    },
+    "websocket": {
+      "endpoint": "WS /ws/logs/{task_id}",
+      "message_format": {
+        "timestamp": "ISO 8601",
+        "agent": "string",
+        "event_type": "string",
+        "message": "string",
+        "data": "object (optional)"
+      }
+    }
+  },
+  
+  "internal_api": {
+    "agent_output": {
+      "sentinel": {
+        "risk_score": "number (0-100)",
+        "findings": "array",
+        "evidence_hash": "string",
+        "timestamp": "ISO 8601"
+      },
+      "oracle": {
+        "liquidity_score": "number",
+        "verification_status": "CONFIRMED | DENIED | UNCERTAIN",
+        "data_sources": "array"
+      },
+      "compliance": {
+        "sanctions_match": "boolean",
+        "risk_modifier": "number",
+        "wallet_age_days": "number"
+      },
+      "zk_prover": {
+        "proof_hash": "string",
+        "verification_key": "string",
+        "mock_mode": "boolean"
+      },
+      "consensus": {
+        "final_verdict": "SAFE | WARNING | DANGER",
+        "final_score": "number (0-100)",
+        "capsule_id": "string",
+        "hydra_tx_id": "string"
+      }
+    }
+  },
+  
+  "threat_proof_capsule": {
+    "cip25_metadata": {
+      "verdict": "string",
+      "risk_score": "number",
+      "consensus_weight": "number",
+      "hydra_signatures": "array",
+      "zk_proof_reference": "string",
+      "evidence_merkle_root": "string",
+      "timestamp": "ISO 8601"
+    }
+  }
+}

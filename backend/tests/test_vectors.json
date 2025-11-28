@@ -1,0 +1,36 @@
+{
+  "_comment": "=============================================================================",
+  "_description": "Sentinel Orchestrator Network (SON) - Test Vectors",
+  "_purpose": "This file contains test vectors for validating agent detection logic",
+  "_usage": "Used by the testing framework to verify threat detection accuracy",
+  "_owner": "All Team Members",
+  "_version": "1.0",
+  "_comment_end": "=============================================================================",
+  
+  "test_cases": [
+    {
+      "id": "test_001",
+      "name": "Known Safe Token",
+      "policy_id": "d5e6bf0500378d4f0da4e8dde6becec7621cd8cbf5",
+      "expected_verdict": "SAFE",
+      "expected_risk_score_max": 20,
+      "description": "A verified, audited token with high liquidity"
+    },
+    {
+      "id": "test_002",
+      "name": "Suspicious Mint Pattern",
+      "policy_id": "a1b2c3d4e5f6789012345678901234567890123456",
+      "expected_verdict": "DANGER",
+      "expected_risk_score_min": 80,
+      "description": "Token with unlimited mint capability in contract"
+    },
+    {
+      "id": "test_003",
+      "name": "Low Liquidity Token",
+      "policy_id": "f9e8d7c6b5a4321098765432109876543210987654",
+      "expected_verdict": "WARNING",
+      "expected_risk_score_range": [40, 70],
+      "description": "New token with very low DEX liquidity"
+    }
+  ]
+}
