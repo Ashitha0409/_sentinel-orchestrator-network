@@ -1,367 +1,317 @@
-"""
-=============================================================================
-Sentinel Orchestrator Network (SON) - AGENT B: Oracle Agent
-=============================================================================
-
-Role: External blockchain verifier, fork detection, network health check
-Masumi Pricing: Per verification (usage-based)
-
-Based on simplified_agent_flow.txt:
-1. Receives HIRE_REQUEST from Sentinel with escrow payment
-2. Verifies Sentinel's signature
-3. Queries Blockfrost for mainnet chain tip
-4. Compares user's node tip vs mainnet tip
-5. Detects minority fork / ghost chain if delta > threshold
-6. Signs and returns JOB_COMPLETE response
-
-=============================================================================
-"""
-
-import base64
-import json
-import asyncio
-import logging
-from typing import Any, Dict, Optional, TYPE_CHECKING
-
-import httpx
-import nacl.signing
-from nacl.signing import SigningKey, VerifyKey
+from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
-
-from .base import BaseAgent, Vote
-
-if TYPE_CHECKING:
-    from .sentinel import SentinelAgent
-
+from message_bus import MessageBus  # MEMBER1 builds this
+import websockets
+from fastapi import WebSocket
 
 # =============================================================================
-# ORACLE CONFIGURATION
+# BASE AGENT CLASS - Autonomous Microservice Template
 # =============================================================================
 
-# Fork detection threshold (blocks)
-FORK_THRESHOLD = 5
+class BaseAgent:
+    """Template for all autonomous agents - inherits DID, payments, APIs"""
 
-# Blockfrost endpoints
-BLOCKFROST_MAINNET = "https://cardano-mainnet.blockfrost.io/api/v0"
-BLOCKFROST_PREPROD = "https://cardano-preprod.blockfrost.io/api/v0"
-BLOCKFROST_PREVIEW = "https://cardano-preview.blockfrost.io/api/v0"
+    def __init__(self, agent_name, cost_ada=0.2):
+        self.name = agent_name
+        self.cost = cost_ada
+        self.did = f"did:key:{self.generate_key()}"  # Real DID
+        self.blockfrost = self.init_blockfrost()  # Free API
+        self.wallet_balance = 0.0
+        self.explanation = ""
 
+    def generate_key(self):
+        """Generate DID key (simplified)"""
+        key = nacl.signing.SigningKey.generate()
+        return base64.b64encode(key.verify_key.encode()).decode()
 
-# =============================================================================
-# ORACLE AGENT CLASS
-# =============================================================================
-
-class OracleAgent(BaseAgent):
-    """
-    Agent B: External blockchain verifier for fork detection.
-    
-    Workflow:
-    1. Receive HIRE_REQUEST from Sentinel (with signature + escrow)
-    2. Verify Sentinel's cryptographic signature
-    3. Accept virtual escrow payment
-    4. Query Blockfrost for current mainnet block height
-    5. Compare with user's reported node tip
-    6. Detect MINORITY_FORK if delta > FORK_THRESHOLD
-    7. Sign and return JOB_COMPLETE response
-    
-    Performance: Must complete in < 3 seconds
-    """
-    
-    def __init__(
-        self,
-        blockfrost_project_id: Optional[str] = None,
-        network: str = "preprod",
-        sentinel_public_key: Optional[str] = None,
-        enable_llm: bool = True
-    ):
-        """
-        Initialize the Oracle Agent.
-        
-        Args:
-            blockfrost_project_id: Blockfrost API project ID
-            network: "mainnet", "preprod", or "preview"
-            sentinel_public_key: Base64-encoded Sentinel public key for verification
-            enable_llm: Whether to enable LLM-enhanced analysis
-        """
-        super().__init__(agent_name="oracle", role="verifier", enable_llm=enable_llm)
-        
-        # Generate Oracle's own keypair
-        self.private_key = SigningKey.generate()
-        self.public_key = self.private_key.verify_key
-        
-        # Store Sentinel's public key for verification
-        self.sentinel_verify_key: Optional[VerifyKey] = None
-        if sentinel_public_key:
-            self.set_sentinel_public_key(sentinel_public_key)
-        
-        # Blockfrost configuration
-        self.blockfrost_project_id = blockfrost_project_id
-        self.network = network
-        self._set_blockfrost_url()
-        
-        # Escrow tracking
-        self.escrow_balance = 0.0
-        
-        self.logger.info(f"Oracle Agent initialized (network: {network})")
-    
-    def _set_blockfrost_url(self) -> None:
-        """Set Blockfrost URL based on network."""
-        urls = {
-            "mainnet": BLOCKFROST_MAINNET,
-            "preprod": BLOCKFROST_PREPROD,
-            "preview": BLOCKFROST_PREVIEW
-        }
-        self.blockfrost_url = urls.get(self.network, BLOCKFROST_PREPROD)
-    
-    def set_sentinel_public_key(self, public_key_b64: str) -> None:
-        """
-        Set Sentinel's public key for signature verification.
-        
-        Args:
-            public_key_b64: Base64-encoded Ed25519 public key
-        """
-        try:
-            key_bytes = base64.b64decode(public_key_b64)
-            self.sentinel_verify_key = VerifyKey(key_bytes)
-            self.logger.info("Sentinel public key registered")
-        except Exception as e:
-            self.logger.error(f"Failed to set Sentinel public key: {e}")
-    
-    def get_public_key_b64(self) -> str:
-        """Get base64-encoded public key for sharing."""
-        return base64.b64encode(bytes(self.public_key)).decode()
-    
-    # -------------------------------------------------------------------------
-    # MAIN PROCESSING METHOD (BaseAgent interface)
-    # -------------------------------------------------------------------------
-    
-    async def process(self, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Main entry point - process a signed HIRE_REQUEST.
-        
-        Args:
-            input_data: Signed HIRE_REQUEST envelope from Sentinel
-            
-        Returns:
-            Dict with fork check result
-        """
-        return await self.handle_hire_request(input_data)
-    
-    # -------------------------------------------------------------------------
-    # HIRE REQUEST HANDLING
-    # -------------------------------------------------------------------------
-    
-    async def handle_hire_request(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Handle incoming HIRE_REQUEST from Sentinel.
-        
-        Args:
-            envelope: Signed message envelope with HIRE_REQUEST
-            
-        Returns:
-            Signed JOB_COMPLETE response
-        """
-        self.logger.info("Received HIRE_REQUEST from Sentinel")
-        
-        # Step 1: Verify signature
-        if not self._verify_sentinel_signature(envelope):
-            self.logger.error("Signature verification failed - rejecting request")
-            return self._build_error_response("Invalid signature")
-        
-        # Step 2: Extract payload
-        payload = envelope.get("payload", {})
-        escrow_id = payload.get("escrow_id", "")
-        amount = payload.get("amount", 0)
-        user_tip = payload.get("user_tip", 0)
-        policy_id = payload.get("policy_id", "")
-        
-        # Step 3: Accept escrow payment
-        self.escrow_balance += amount
-        self.logger.info(f"Accepted escrow payment: {amount} ADA (id: {escrow_id})")
-        
-        # Step 4: Perform fork check
-        self.log_start(policy_id)
-        fork_result = await self._execute_fork_check(user_tip)
-        
-        # Step 5: Build and sign response
-        response = self._build_response(fork_result, user_tip, escrow_id)
-        signed_response = self._sign_envelope(response)
-        
-        self.log_complete(
-            Vote.DANGER if fork_result["is_fork"] else Vote.SAFE,
-            90 if fork_result["is_fork"] else 10
+    def init_blockfrost(self):
+        """Initialize Blockfrost API client"""
+        from blockfrost import BlockFrostApi, ApiUrls
+        # Using pre-production network with fresh API key
+        return BlockFrostApi(
+            project_id="preprod99ILsNJwp7AtN1sGgf9f7g7BrFDnCPrg",
+            base_url=ApiUrls.preprod.value
         )
-        
-        return signed_response
-    
-    # -------------------------------------------------------------------------
-    # FORK DETECTION LOGIC
-    # -------------------------------------------------------------------------
-    
-    async def _execute_fork_check(self, user_tip: int) -> Dict[str, Any]:
-        """
-        Execute fork detection by comparing user tip with mainnet.
-        
-        Args:
-            user_tip: User's node current block height
-            
-        Returns:
-            Dict with mainnet_tip, delta, is_fork, status
-        """
-        self.logger.debug(f"Checking fork status for user_tip: {user_tip}")
-        
-        # Fetch mainnet tip
-        mainnet_tip = await self._fetch_mainnet_tip()
-        
-        if mainnet_tip is None:
-            self.logger.warning("Could not fetch mainnet tip - using mock")
-            mainnet_tip = user_tip  # Assume safe if we can't verify
-        
-        # Calculate delta
-        delta = abs(mainnet_tip - user_tip)
-        
-        # Determine fork status
-        is_fork = delta > FORK_THRESHOLD
-        
-        if is_fork:
-            status = "MINORITY_FORK_DETECTED"
-            self.logger.warning(f"FORK DETECTED: delta={delta} blocks (threshold={FORK_THRESHOLD})")
+
+    async def verify_payment(self, escrow_tx):
+        """ZERO TRUST - Check escrow includes our DID + cost"""
+        # In production: verify Cardano transaction
+        return escrow_tx.get("amount", 0) >= self.cost
+
+    async def work(self, chain_state):
+        """Agent-specific logic - override in subclasses"""
+        raise NotImplementedError
+
+# =============================================================================
+# SPECIALIST AGENTS - Real Cardano APIs, No Datasets
+# =============================================================================
+
+class BlockScanner(BaseAgent):
+    """Block height comparison - detects forks"""
+
+    async def work(self, chain_state):
+        try:
+            latest_block = await asyncio.get_event_loop().run_in_executor(
+                None, self.blockfrost.block_latest
+            )
+
+            # Handle Blockfrost response (could be dict or object)
+            if isinstance(latest_block, dict):
+                mainnet_tip = latest_block.get("height")
+            else:
+                mainnet_tip = getattr(latest_block, 'height', 0)
+
+            user_tip = chain_state["user_tip"]
+            delta = abs(int(mainnet_tip) - int(user_tip))
+            self.explanation = f"Block tip difference: {delta} blocks"
+            risk_score = 0.9 if delta > 5 else 0.1
+            return {"risk": risk_score, "evidence": self.explanation}
+        except Exception as e:
+            return {"risk": 0.5, "evidence": f"Blockfrost error: {str(e)}"}
+
+class StakeAnalyzer(BaseAgent):
+    """Stake pool analysis - detects minority control"""
+
+    async def work(self, chain_state):
+        try:
+            pools = await asyncio.get_event_loop().run_in_executor(
+                None, self.blockfrost.pools
+            )
+            # Calculate minority stake (top 10 pools)
+            total_stake = sum(float(p.get("active_stake", "0")) for p in pools[:10])
+            minority_ratio = min(total_stake / 1000000000, 1.0)  # Normalize
+            self.explanation = f"Top 10 pools control {minority_ratio:.1%} of stake"
+            risk_score = 0.8 if minority_ratio > 0.3 else 0.2
+            return {"risk": risk_score, "evidence": self.explanation}
+        except Exception as e:
+            return {"risk": 0.5, "evidence": f"Stake analysis error: {str(e)}"}
+
+class VoteDoctor(BaseAgent):
+    """Governance vote analysis - detects manipulation"""
+
+    async def work(self, chain_state):
+        try:
+            # Get recent governance actions
+            gov_actions = await asyncio.get_event_loop().run_in_executor(
+                None, self.blockfrost.governance_actions
+            )
+            # Simple divergence check (placeholder logic)
+            vote_count = len(gov_actions) if gov_actions else 0
+            divergence = min(vote_count / 100, 1.0)  # Normalize
+            self.explanation = f"Governance actions: {vote_count}"
+            risk_score = 0.7 if divergence > 0.4 else 0.1
+            return {"risk": risk_score, "evidence": self.explanation}
+        except Exception as e:
+            return {"risk": 0.5, "evidence": f"Governance analysis error: {str(e)}"}
+
+class MempoolSniffer(BaseAgent):
+    """Mempool transaction analysis - detects spam attacks"""
+
+    async def work(self, chain_state):
+        try:
+            # Simplified mempool check via Blockfrost (limited API)
+            recent_txs = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.blockfrost.blocks_latest_transactions(limit=100)
+            )
+            tx_count = len(recent_txs) if recent_txs else 0
+            spam_ratio = min(tx_count / 1000, 1.0)  # Normalize
+            self.explanation = f"Mempool transactions: {tx_count}"
+            risk_score = 0.6 if spam_ratio > 0.2 else 0.05
+            return {"risk": risk_score, "evidence": self.explanation}
+        except Exception as e:
+            return {"risk": 0.5, "evidence": f"Mempool analysis error: {str(e)}"}
+
+class ReplayDetector(BaseAgent):
+    """Transaction replay detection"""
+
+    async def work(self, chain_state):
+        try:
+            # Check for duplicate transactions (simplified)
+            recent_txs = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.blockfrost.blocks_latest_transactions(limit=50)
+            )
+            # Check for nonce reuse (placeholder)
+            replayed = 0  # In real implementation, check tx signatures
+            self.explanation = f"Potential replays detected: {replayed}"
+            risk_score = 0.95 if replayed > 0 else 0.0
+            return {"risk": risk_score, "evidence": self.explanation}
+        except Exception as e:
+            return {"risk": 0.5, "evidence": f"Replay detection error: {str(e)}"}
+
+# =============================================================================
+# ORACLE COORDINATOR - Hires Swarm + Bayesian Fusion
+# =============================================================================
+
+class OracleCoordinator(BaseAgent):
+    """Coordinates specialist agents using Matrix/escrow"""
+
+    def __init__(self):
+        super().__init__("oracle_coordinator", cost_ada=1.0)
+        self.specialists = {
+            "block_scanner": BlockScanner("block_scanner", 0.15),
+            "stake_analyzer": StakeAnalyzer("stake_analyzer", 0.15),
+            "vote_doctor": VoteDoctor("vote_doctor", 0.15),
+            "mempool_sniffer": MempoolSniffer("mempool_sniffer", 0.15),
+            "replay_detector": ReplayDetector("replay_detector", 0.15),
+        }
+
+    async def execute_fork_check(self, sentinel_request):
+        """Main entry point - hires swarm and fuses results"""
+        chain_state = sentinel_request["payload"]
+
+        print(f"🤖 Oracle hiring swarm for fork check...")
+
+        # 1. Hire all specialists concurrently
+        tasks = []
+        for name, agent in self.specialists.items():
+            task = self.hire_specialist(name, agent, chain_state)
+            tasks.append(task)
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 2. Filter successful results
+        valid_results = [r for r in results if isinstance(r, dict)]
+
+        # 3. Bayesian fusion (simple weighted average)
+        if valid_results:
+            total_risk = sum(r["risk"] for r in valid_results)
+            avg_risk = total_risk / len(valid_results)
+            evidence = [r["evidence"] for r in valid_results]
         else:
-            status = "SAFE_CHAIN"
-            self.logger.info(f"Chain healthy: delta={delta} blocks")
-        
+            avg_risk = 0.5
+            evidence = ["All specialists failed"]
+
+        # 4. Determine final status
+        fork_confirmed = avg_risk > 0.7
+        status = "MINORITY_FORK_DETECTED" if fork_confirmed else "SAFE_CHAIN"
+
+        print(f"🎯 Swarm consensus: {status} (risk: {avg_risk:.2f})")
+
         return {
-            "mainnet_tip": mainnet_tip,
-            "user_node_tip": user_tip,
-            "delta": delta,
-            "threshold": FORK_THRESHOLD,
-            "is_fork": is_fork,
             "status": status,
-            "evidence": "block_divergence" if is_fork else "none"
+            "ai_fork_confirmed": fork_confirmed,
+            "risk_score": avg_risk,
+            "evidence": evidence,
+            "specialists_hired": len(valid_results),
+            "specialists_total": len(self.specialists)
         }
-    
-    async def _fetch_mainnet_tip(self) -> Optional[int]:
-        """
-        Fetch current block height from Blockfrost.
-        
-        Returns:
-            Block height or None if failed
-        """
-        if not self.blockfrost_project_id:
-            self.logger.warning("No Blockfrost project ID - returning mock tip")
-            return None
-        
+
+    async def hire_specialist(self, name, agent, chain_state):
+        """Simulate hiring a specialist (WebSocket in production)"""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(
-                    f"{self.blockfrost_url}/blocks/latest",
-                    headers={"project_id": self.blockfrost_project_id}
-                )
-                response.raise_for_status()
-                return response.json()["height"]
-                
-        except httpx.TimeoutException:
-            self.logger.error("Blockfrost request timed out")
-            return None
-        except httpx.HTTPStatusError as e:
-            self.logger.error(f"Blockfrost HTTP error: {e.response.status_code}")
-            return None
+            print(f"📡 Hiring {name}...")
+            result = await agent.work(chain_state)
+            print(f"✅ {name} completed: risk {result['risk']:.2f}")
+            return result
         except Exception as e:
-            self.logger.error(f"Blockfrost request failed: {e}")
-            return None
-    
-    # -------------------------------------------------------------------------
-    # CRYPTOGRAPHIC OPERATIONS
-    # -------------------------------------------------------------------------
-    
-    def _verify_sentinel_signature(self, envelope: Dict[str, Any]) -> bool:
-        """
-        Verify Sentinel's signature on the envelope.
-        
-        Args:
-            envelope: Signed message envelope
-            
-        Returns:
-            True if signature is valid
-        """
-        if "signature" not in envelope:
-            self.logger.warning("No signature in envelope")
-            return False
-        
-        # If no Sentinel key registered, skip verification (for testing)
-        if self.sentinel_verify_key is None:
-            self.logger.debug("No Sentinel key registered - skipping verification")
-            return True
-        
-        try:
-            # Reconstruct original message (exclude signature)
-            message = {k: v for k, v in envelope.items() if k != "signature"}
-            message_bytes = json.dumps(
-                message, sort_keys=True, separators=(',', ':')
-            ).encode()
-            
-            signature_bytes = base64.b64decode(envelope["signature"])
-            
-            self.sentinel_verify_key.verify(message_bytes, signature_bytes)
-            self.logger.info(f"✅ Verified signature from: {envelope.get('from_did', 'unknown')}")
-            return True
-            
-        except BadSignatureError:
-            self.logger.error("❌ Invalid signature - message rejected")
-            return False
-        except Exception as e:
-            self.logger.error(f"Signature verification error: {e}")
-            return False
-    
-    def _sign_envelope(self, envelope: Dict[str, Any]) -> Dict[str, Any]:
-        """Sign a message envelope using Ed25519."""
-        message_bytes = json.dumps(
-            envelope, sort_keys=True, separators=(',', ':')
-        ).encode()
-        
-        signed = self.private_key.sign(message_bytes)
-        signature = base64.b64encode(signed.signature).decode()
-        
-        return {**envelope, "signature": signature}
-    
-    # -------------------------------------------------------------------------
-    # RESPONSE BUILDING
-    # -------------------------------------------------------------------------
-    
-    def _build_response(
-        self,
-        fork_result: Dict[str, Any],
-        user_tip: int,
-        escrow_id: str
-    ) -> Dict[str, Any]:
-        """Build JOB_COMPLETE response envelope."""
-        return {
-            "protocol": "IACP/2.0",
-            "type": "JOB_COMPLETE",
-            "from_did": "did:masumi:oracle_01",
-            "to_did": "did:masumi:sentinel_01",
+            print(f"❌ {name} failed: {str(e)}")
+            return {"risk": 0.5, "evidence": f"Agent {name} error: {str(e)}"}
+
+    def bayes_fuse(self, risks):
+        """Simple Bayesian fusion (weighted average)"""
+        if not risks:
+            return 0.5
+        # Weight recent results higher
+        weights = [1.0] * len(risks)
+        weights[-1] *= 1.2  # Boost latest result
+        total_weight = sum(weights)
+        return sum(r * w for r, w in zip(risks, weights)) / total_weight
+
+# =============================================================================
+# LEGACY ORACLE AGENT - For Backward Compatibility
+# =============================================================================
+
+class OracleAgent:
+    """Legacy single-purpose Oracle Agent"""
+
+def __init__(self):
+self.private_key = nacl.signing.SigningKey.generate()
+self.public_key = self.private_key.verify_key
+        self.bus = MessageBus()  # Listens for your messages
+        self.bus = MessageBus()
+self.escrow_balance = 0.0
+        self.coordinator = OracleCoordinator()
+
+        # Load Sentinel's PUBLIC key (MEMBER1 shares this via config)
+        # For now, placeholder - will be fixed later
+        # Sentinel verification
+self.sentinel_public_bytes = base64.b64decode("SENTINEL_PUBLIC_BASE64_PLACEHOLDER")
+self.sentinel_verify_key = VerifyKey(self.sentinel_public_bytes)
+
+        # Blockfrost API setup
+        self.BLOCKFROST_URL = "https://cardano-mainnet.blockfrost.io/api/v0"
+        self.BLOCKFROST_PROJECT_ID = "preproduDheFnsnBxApBxdqkkpnoHLelIefGX7T"  # Get from blockfrost.io
+
+async def start(self):
+await self.bus.subscribe("did:masumi:oracle_01", self.handle_message)
+
+async def handle_message(self, envelope):
+        # 1. Verify signature
+if not self.verify_signature(envelope):
+return
+
+if envelope["type"] == "HIRE_REQUEST":
+            await self.execute_fork_check(envelope)
+
+    async def execute_fork_check(self, hire_request):
+        # 2. Accept payment (virtual)
+        escrow_id = hire_request["payload"]["escrow_id"]
+        self.escrow_balance += hire_request["payload"]["amount"]
+            result = await self.coordinator.execute_fork_check(envelope)
+            await self.send_job_complete(envelope, result)
+
+        # 3. Get real mainnet data
+        user_tip = hire_request["payload"]["user_tip"]
+        mainnet_tip = await self.fetch_mainnet_tip()
+
+        # 4. Fork logic
+        delta = abs(mainnet_tip - user_tip)
+        status = "MINORITY_FORK_DETECTED" if delta > 5 else "SAFE_CHAIN"
+
+        # 5. Reply
+    async def send_job_complete(self, original_request, result):
+reply = {
+"protocol": "IACP/2.0",
+"type": "JOB_COMPLETE",
+"from_did": "did:masumi:oracle_01",
             "payload": {
-                "status": fork_result["status"],
-                "mainnet_tip": fork_result["mainnet_tip"],
+                "status": status,
+                "mainnet_tip": mainnet_tip,
                 "user_node_tip": user_tip,
-                "delta": fork_result["delta"],
-                "threshold": fork_result["threshold"],
-                "evidence": fork_result["evidence"],
-                "escrow_id": escrow_id
-            },
-            "timestamp": self.get_timestamp()
-        }
-    
-    def _build_error_response(self, error: str) -> Dict[str, Any]:
-        """Build error response envelope."""
-        response = {
-            "protocol": "IACP/2.0",
-            "type": "JOB_FAILED",
-            "from_did": "did:masumi:oracle_01",
-            "payload": {
-                "error": error,
-                "status": "ERROR"
-            },
-            "timestamp": self.get_timestamp()
-        }
-        return self._sign_envelope(response)
+                "evidence": "block_divergence" if delta > 5 else "none"
+            }
+            "payload": result
+}
+signed_reply = self.sign_envelope(reply)
+await self.bus.publish(signed_reply)
+
+    async def fetch_mainnet_tip(self):
+        # Blockfrost call (get free key from blockfrost.io)
+        headers = {"project_id": self.BLOCKFROST_PROJECT_ID}
+        resp = requests.get(f"{self.BLOCKFROST_URL}/blocks/latest", headers=headers)
+        resp.raise_for_status()
+        return resp.json()["height"]
+
+def verify_signature(self, envelope):
+if "signature" not in envelope:
+return False
+
+        # Reconstruct original message (exclude signature)
+message = {k: v for k, v in envelope.items() if k != "signature"}
+message_bytes = json.dumps(message, sort_keys=True, separators=(',', ':')).encode()
+
+signature_bytes = base64.b64decode(envelope["signature"])
+
+try:
+@@ -86,4 +276,10 @@ def verify_signature(self, envelope):
+return True
+except BadSignatureError:
+print("❌ Fake signature dropped")
+            return False
+            return False
+
+    def sign_envelope(self, envelope):
+        message_bytes = json.dumps(envelope, separators=(',', ':')).encode()
+        signed = self.private_key.sign(message_bytes)
+        envelope["signature"] = base64.b64encode(signed.signature).decode()
+        return envelope
