@@ -164,19 +164,11 @@ class MessageBus:
                 message, sort_keys=True, separators=(',', ':')
             ).encode('utf-8')
             
-            # Decode signature (try hex first, then base64)
-            signature_bytes = None
-            try:
-                if len(signature_b64) < 200:
-                    signature_bytes = bytes.fromhex(signature_b64)
-            except ValueError:
-                pass
-            
-            if not signature_bytes:
-                signature_bytes = __import__('base64').b64decode(signature_b64)
+            import base64 as b64
+            signature_bytes = b64.b64decode(signature_b64)
             
             # Verify
-            public_key_bytes = __import__('base64').b64decode(public_key_b64)
+            public_key_bytes = b64.b64decode(public_key_b64)
             verify_key = VerifyKey(public_key_bytes)
             verify_key.verify(message_bytes, signature_bytes)
             
