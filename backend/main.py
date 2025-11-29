@@ -287,7 +287,7 @@ async def get_cryptographic_proof(task_id: str):
 async def get_system_status():
     """Return real-time status of the agent network."""
     # Check Hydra connection
-    hydra_status = "Active" if sentinel.hydra_node and sentinel.hydra_node.hydra_client and sentinel.hydra_node.hydra_client.websocket else "Offline"
+    hydra_status = "Active" if sentinel.hydra_node and sentinel.hydra_node.client and sentinel.hydra_node.client.connection else "Offline"
     
     return {
         "sentinel": "Active",

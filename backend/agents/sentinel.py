@@ -388,6 +388,18 @@ class SentinelAgent(BaseAgent):
                     90,
                     "DANGER_REPLAY_ATTACK: Node on minority fork"
                 )
+            elif oracle_status == "NETWORK_RISK_DETECTED":
+                return (
+                    Vote.DANGER,
+                    85,
+                    "THREAT DETECTED: Network consensus or asset verification failed"
+                )
+            elif oracle_status == "GOVERNANCE_RISK_DETECTED":
+                return (
+                    Vote.DANGER,
+                    80,
+                    "THREAT DETECTED: Governance attack or voting anomaly"
+                )
             elif oracle_status == "SAFE_CHAIN":
                 return (
                     Vote.SAFE,
