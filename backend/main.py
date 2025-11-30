@@ -11,7 +11,8 @@ from agents.specialists import (
 )
 from agents.governance import (
     ProposalFetcher, PolicyAnalyzer, 
-    SentimentAnalyzer, GovernanceOrchestrator
+    SentimentAnalyzer, GovernanceOrchestrator,
+    TreasuryGuardian
 )
 import uuid
 import logging
@@ -47,8 +48,6 @@ message_bus = MessageBus()
 # CORE AGENTS (Sentinel & Oracle)
 # =============================================================================
 
-sentinel = SentinelAgent(enable_llm=True)
-=======
 # Initialize Agents
 sentinel = SentinelAgent(enable_llm=True, enable_hydra=True)
 oracle = OracleAgent(enable_llm=True)
@@ -84,14 +83,15 @@ logger.info(f"✅ Specialist agents available: {list(specialist_agents.keys())}"
 # GOVERNANCE AGENTS
 # =============================================================================
 
-governance_orchestrator = GovernanceOrchestrator(enable_llm=True)
+drep_helper = GovernanceOrchestrator()
 proposal_fetcher = ProposalFetcher()
-policy_analyzer = PolicyAnalyzer(enable_llm=True)
+policy_analyzer = PolicyAnalyzer()
 sentiment_analyzer = SentimentAnalyzer()
+treasury_guardian = TreasuryGuardian(enable_llm=True)
 
 # Register governance agents with MessageBus
-message_bus.register_agent("did:masumi:governance_orchestrator_01", 
-                          governance_orchestrator.get_public_key_b64() if hasattr(governance_orchestrator, 'get_public_key_b64') else "")
+message_bus.register_agent("did:masumi:drep_helper_01", 
+                          drep_helper.get_public_key_b64() if hasattr(drep_helper, 'get_public_key_b64') else "")
 logger.info("✅ Governance agents initialized: Orchestrator, ProposalFetcher, PolicyAnalyzer, SentimentAnalyzer")
 
 # =============================================================================
@@ -105,10 +105,11 @@ agent_registry = {
     },
     "specialists": specialist_agents,
     "governance": {
-        "governance_orchestrator": governance_orchestrator,
+        "drep_helper": drep_helper,
         "proposal_fetcher": proposal_fetcher,
         "policy_analyzer": policy_analyzer,
         "sentiment_analyzer": sentiment_analyzer,
+        "treasury_guardian": treasury_guardian,
     }
 }
 
@@ -407,7 +408,7 @@ async def agents_info():
             for name in specialist_agents.keys()
         },
         "governance_agents": {
-            "governance_orchestrator": {
+            "drep_helper": {
                 "role": "governance_coordinator",
                 "status": "active",
                 "description": "Coordinates governance analysis across all proposals"
@@ -460,7 +461,7 @@ async def agents_health():
         }
     
     # Governance agents
-    health_status["agents"]["governance_orchestrator"] = {
+    health_status["agents"]["drep_helper"] = {
         "status": "healthy",
         "type": "governance"
     }
@@ -493,7 +494,7 @@ async def agents_list():
             for name in specialist_agents.keys()
         },
         "governance_agents": {
-            "governance_orchestrator": "Governance Orchestrator - Coordinates governance analysis",
+            "drep_helper": "Governance Orchestrator - Coordinates governance analysis",
             "proposal_fetcher": "Proposal Fetcher - Retrieves proposals from IPFS",
             "policy_analyzer": "Policy Analyzer - Checks constitutional compliance",
             "sentiment_analyzer": "Sentiment Analyzer - Analyzes community sentiment"
@@ -563,7 +564,7 @@ async def governance_status():
     return {
         "status": "operational",
         "agents": {
-            "governance_orchestrator": {
+            "drep_helper": {
                 "status": "active",
                 "role": "coordinator",
                 "description": "Coordinates governance analysis"
@@ -613,7 +614,7 @@ async def analyze_governance(request: Dict[str, Any], background_tasks: Backgrou
         sentiment_result = sentiment_analyzer.process(proposals)
         
         # Orchestrate final analysis
-        orchestration_result = governance_orchestrator.process({
+        orchestration_result = drep_helper.process({
             "proposals": proposals,
             "policy_analysis": policy_result,
             "sentiment_analysis": sentiment_result
@@ -639,22 +640,97 @@ async def check_proposal(request: Dict[str, Any]):
     """Check a specific proposal for constitutional compliance"""
     try:
         proposal = request.get("proposal", {})
+        ipfs_hash = request.get("ipfs_hash")
+
+        # If IPFS hash provided, fetch metadata first
+        if ipfs_hash:
+            logger.info(f"Fetching proposal metadata for hash: {ipfs_hash}")
+            metadata = await proposal_fetcher.fetch_metadata(ipfs_hash)
+            
+            # Convert dataclass to dict for analysis
+            proposal = {
+                "id": ipfs_hash,
+                "title": metadata.title,
+                "abstract": metadata.abstract,
+                "motivation": metadata.motivation,
+                "rationale": metadata.rationale,
+                "amount": metadata.amount,
+                "references": metadata.references
+            }
         
         # Check policy compliance
-        policy_result = policy_analyzer.process([proposal])
+        policy_result = await policy_analyzer.analyze(proposal)
         
-        # Analyze sentiment
+        # Analyze sentiment (mocked for now as we don't have real on-chain voting data source in this context)
+        # In a real scenario, we'd query a db or indexer
         sentiment_result = sentiment_analyzer.process([proposal])
         
         return {
             "proposal_id": proposal.get("id"),
-            "policy_compliance": policy_result,
+            "policy_compliance": {
+                "summary": policy_result.summary,
+                "technical_summary": policy_result.technical_summary,
+                "flags": policy_result.flags,
+                "recommendation": policy_result.recommendation,
+                "reasoning": policy_result.reasoning,
+                "confidence": policy_result.confidence,
+                "complexity_score": policy_result.complexity_score
+            },
             "sentiment": sentiment_result,
             "timestamp": datetime.utcnow().isoformat() + "Z"
         }
         
     except Exception as e:
         logging.error(f"Error checking proposal: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# TREASURY GUARDIAN ENDPOINTS
+# =============================================================================
+
+@app.post("/api/v1/treasury/analyze")
+async def analyze_treasury_proposal(request: Dict[str, Any]):
+    """
+    Analyze a treasury withdrawal proposal for anomalies.
+    """
+    try:
+        result = await treasury_guardian.process(request)
+        return result
+    except Exception as e:
+        logging.error(f"Error in treasury analysis: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/treasury/risk/current")
+async def get_current_treasury_risk():
+    """
+    Get the current treasury risk report (daily summary).
+    """
+    # For MVP, we generate a fresh report based on a mock "current state"
+    # In production, this would return the latest cached daily report
+    try:
+        # Mocking a "current" proposal for the report
+        mock_proposal = {
+            "proposal_id": "gov_action_" + str(uuid.uuid4())[:8],
+            "amount": 50_000_000_000_000, # 50M ADA
+            "proposer_id": "stake_test1...",
+            "metadata": {
+                "title": "Ecosystem Growth Fund",
+                "abstract": "We want 50M ADA to grow the ecosystem.",
+                "rationale": "Trust us."
+            }
+        }
+        result = await treasury_guardian.process(mock_proposal)
+        return {
+            "date": datetime.utcnow().date().isoformat(),
+            "epoch": 450, # Mock epoch
+            "treasury_balance_ada": 1_500_000_000,
+            "active_proposals": 1,
+            "high_risk_proposals": 1 if result["risk_score"] > 50 else 0,
+            "latest_analysis": result
+        }
+    except Exception as e:
+        logging.error(f"Error getting treasury risk: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
